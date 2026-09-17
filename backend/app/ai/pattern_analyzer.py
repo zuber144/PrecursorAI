@@ -229,6 +229,7 @@ async def analyze_cluster(
 
     generation_config = {
         "response_mime_type": "application/json",
+        "response_schema": GeminiPatternOutput,
         "temperature": 0.15,      # Slightly higher than Tier 1 for nuanced reasoning
         "max_output_tokens": 1024,
     }

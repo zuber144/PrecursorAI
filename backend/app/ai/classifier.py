@@ -431,6 +431,7 @@ async def classify_report(
 
     generation_config = {
         "response_mime_type": "application/json",
+        "response_schema": GeminiAnalysisOutput,
         "temperature": 0.1,      # Low temperature for consistent, reliable JSON
         "max_output_tokens": 1024,
     }
