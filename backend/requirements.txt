@@ -14,11 +14,8 @@ alembic==1.13.2
 # pgvector
 pgvector==0.3.3
 
-# Google Gemini (embeddings only)
+# Google Gemini
 google-generativeai==0.8.2
-
-# Ollama / OpenAI-compatible client (text generation)
-openai>=1.40.0
 
 # Numerical / similarity
 numpy==2.1.1
