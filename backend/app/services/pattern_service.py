@@ -24,6 +24,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.ai.embeddings import embed_text
 from app.core.config import settings
 from app.models.analysis import ReportAnalysis
 from app.models.embedding import ReportEmbedding
@@ -167,14 +168,113 @@ async def find_candidate_groups(db: AsyncSession) -> List[CandidateGroup]:
 
 # ── Phase C: Semantic clustering ──────────────────────────────────────────────
 
+async def _load_or_create_embeddings(
+    candidate: CandidateGroup,
+    db: AsyncSession,
+) -> dict[uuid.UUID, List[float]]:
+    """Load existing Tier 1 embeddings and backfill historical reports that lack one."""
+    if not candidate.report_ids:
+        return {}
+
+    stmt = select(ReportEmbedding).where(
+        ReportEmbedding.report_id.in_(candidate.report_ids)
+    )
+    result = await db.execute(stmt)
+    existing = result.scalars().all()
+
+    id_to_vec: dict[uuid.UUID, List[float]] = {}
+    for item in existing:
+        vector = _normalise_embedding(item.embedding)
+        if vector:
+            id_to_vec[item.report_id] = vector
+
+    missing_ids = [rid for rid in candidate.report_ids if rid not in id_to_vec]
+
+    if missing_ids:
+        logger.warning(
+            "[Tier2] Candidate '%s' — %d/%d reports have no embedding. "
+            "Backfilling historical embeddings.",
+            candidate.group_key,
+            len(missing_ids),
+            len(candidate.report_ids),
+        )
+
+        text_stmt = select(Report.id, Report.report_text).where(
+            Report.id.in_(missing_ids)
+        )
+        result = await db.execute(text_stmt)
+
+        for report_id, report_text in result.all():
+            try:
+                vector = _normalise_embedding(await embed_text(report_text))
+                if not vector:
+                    logger.error(
+                        "[Tier2] Empty embedding generated for report %s",
+                        report_id,
+                    )
+                    continue
+
+                db.add(
+                    ReportEmbedding(
+                        report_id=report_id,
+                        embedding=vector,
+                        model="gemini-embedding-001",
+                    )
+                )
+                id_to_vec[report_id] = vector
+                logger.info(
+                    "[Tier2] Backfilled embedding for report %s",
+                    report_id,
+                )
+            except Exception:
+                logger.exception(
+                    "[Tier2] Failed to backfill embedding for report %s",
+                    report_id,
+                )
+
+        await db.flush()
+
+    logger.info(
+        "[Tier2] Candidate '%s' — usable embeddings: %d/%d",
+        candidate.group_key,
+        len(id_to_vec),
+        len(candidate.report_ids),
+    )
+    return id_to_vec
+
+
+def _normalise_embedding(value) -> List[float]:
+    """Convert pgvector/list/numpy/string values to a plain float list."""
+    if value is None:
+        return []
+    if isinstance(value, np.ndarray):
+        return value.astype(np.float32).tolist()
+    if isinstance(value, str):
+        value = value.strip()
+        if value.startswith("[") and value.endswith("]"):
+            value = value[1:-1]
+        if not value:
+            return []
+        return [float(x.strip()) for x in value.split(",") if x.strip()]
+    try:
+        return [float(x) for x in value]
+    except (TypeError, ValueError):
+        return []
+
+
 def _cosine_similarity(a: List[float], b: List[float]) -> float:
     """Pure-numpy cosine similarity between two embedding vectors."""
-    va = np.array(a, dtype=np.float32)
-    vb = np.array(b, dtype=np.float32)
+    va = np.asarray(_normalise_embedding(a), dtype=np.float32)
+    vb = np.asarray(_normalise_embedding(b), dtype=np.float32)
+
+    if va.size == 0 or vb.size == 0 or va.size != vb.size:
+        return 0.0
+
     norm_a = np.linalg.norm(va)
     norm_b = np.linalg.norm(vb)
     if norm_a == 0 or norm_b == 0:
         return 0.0
+
     return float(np.dot(va, vb) / (norm_a * norm_b))
 
 
@@ -182,93 +282,112 @@ async def cluster_candidate_reports(
     candidate: CandidateGroup,
     db: AsyncSession,
 ) -> List[ReportCluster]:
-    """
-    Phase C — Steps 5-8.
+    """Cluster candidate reports using true greedy single-linkage semantics."""
+    sim_threshold = float(settings.COGNITION_SIMILARITY_THRESHOLD)
+    id_to_vec = await _load_or_create_embeddings(candidate, db)
 
-    For the given candidate group:
-      1. Pull stored embeddings for all its reports.
-      2. Compute pairwise cosine similarity.
-      3. Group reports above COGNITION_SIMILARITY_THRESHOLD into clusters
-         using a simple greedy single-linkage approach.
-
-    Returns a list of ReportCluster objects (may be empty if no embeddings exist).
-    """
-    sim_threshold = settings.COGNITION_SIMILARITY_THRESHOLD
-
-    # Fetch embeddings for this candidate's reports
-    emb_stmt = (
-        select(ReportEmbedding)
-        .where(ReportEmbedding.report_id.in_(candidate.report_ids))
-    )
-    result = await db.execute(emb_stmt)
-    embeddings = result.scalars().all()
-
-    if len(embeddings) < 2:
-        logger.info(
-            "[Tier2] Candidate '%s' has < 2 embeddings — skipping clustering.",
+    if len(id_to_vec) < 2:
+        logger.warning(
+            "[Tier2] Candidate '%s' has only %d usable embedding(s).",
             candidate.group_key,
+            len(id_to_vec),
         )
-        # Still return a single-report cluster if at least one embedding exists
-        if len(embeddings) == 1:
-            return [ReportCluster(
-                candidate=candidate,
-                report_ids=[embeddings[0].report_id],
-                similarity_scores=[1.0],
-                avg_similarity=1.0,
-            )]
         return []
 
-    # Build id -> vector lookup
-    id_to_vec: dict[uuid.UUID, List[float]] = {
-        e.report_id: e.embedding for e in embeddings
-    }
-    report_ids = list(id_to_vec.keys())
+    report_ids = [rid for rid in candidate.report_ids if rid in id_to_vec]
     n = len(report_ids)
 
-    # Pairwise similarity matrix
-    sim_matrix: dict[tuple, float] = {}
+    logger.info(
+        "[Tier2] Candidate '%s' — comparing %d embeddings at threshold %.2f",
+        candidate.group_key,
+        n,
+        sim_threshold,
+    )
+
+    sim_matrix: dict[tuple[int, int], float] = {}
+    max_similarity = -1.0
+    max_pair = None
+
     for i in range(n):
         for j in range(i + 1, n):
-            s = _cosine_similarity(id_to_vec[report_ids[i]], id_to_vec[report_ids[j]])
-            sim_matrix[(i, j)] = s
-            sim_matrix[(j, i)] = s
-
-    # Greedy single-linkage clustering
-    visited = set()
-    clusters: List[ReportCluster] = []
-
-    for i in range(n):
-        if i in visited:
-            continue
-        cluster_indices = [i]
-        visited.add(i)
-        for j in range(n):
-            if j in visited:
-                continue
-            # Join if similar enough to ANY existing cluster member
-            if any(sim_matrix.get((k, j), 0.0) >= sim_threshold for k in cluster_indices):
-                cluster_indices.append(j)
-                visited.add(j)
-
-        cluster_ids = [report_ids[idx] for idx in cluster_indices]
-        pair_sims = [
-            sim_matrix.get((cluster_indices[a], cluster_indices[b]), 0.0)
-            for a in range(len(cluster_indices))
-            for b in range(a + 1, len(cluster_indices))
-        ]
-        avg_sim = float(np.mean(pair_sims)) if pair_sims else 1.0
-
-        clusters.append(ReportCluster(
-            candidate=candidate,
-            report_ids=cluster_ids,
-            similarity_scores=pair_sims,
-            avg_similarity=avg_sim,
-        ))
+            score = _cosine_similarity(id_to_vec[report_ids[i]], id_to_vec[report_ids[j]])
+            sim_matrix[(i, j)] = score
+            sim_matrix[(j, i)] = score
+            if score > max_similarity:
+                max_similarity = score
+                max_pair = (report_ids[i], report_ids[j])
 
     logger.info(
-        "[Tier2] Candidate '%s' — %d report(s) → %d cluster(s).",
-        candidate.group_key, n, len(clusters),
+        "[Tier2] Candidate '%s' — max pair similarity=%.4f, threshold=%.4f",
+        candidate.group_key,
+        max_similarity,
+        sim_threshold,
     )
+
+    if max_pair:
+        logger.debug(
+            "[Tier2] Max similarity pair: %s <-> %s",
+            max_pair[0],
+            max_pair[1],
+        )
+
+    visited: set[int] = set()
+    clusters: List[ReportCluster] = []
+
+    for seed in range(n):
+        if seed in visited:
+            continue
+
+        members = [seed]
+        join_scores = [1.0]
+        visited.add(seed)
+
+        # Expand until no new member can be connected to any current member.
+        changed = True
+        while changed:
+            changed = False
+            for j in range(n):
+                if j in visited:
+                    continue
+
+                best_score = max(
+                    (sim_matrix.get((k, j), 0.0) for k in members),
+                    default=0.0,
+                )
+
+                if best_score >= sim_threshold:
+                    members.append(j)
+                    join_scores.append(best_score)
+                    visited.add(j)
+                    changed = True
+
+        # Tier 2 patterns must contain multiple reports.
+        if len(members) < 2:
+            continue
+
+        cluster_ids = [report_ids[i] for i in members]
+        pairwise_scores = [
+            sim_matrix.get((members[a], members[b]), 0.0)
+            for a in range(len(members))
+            for b in range(a + 1, len(members))
+        ]
+
+        clusters.append(
+            ReportCluster(
+                candidate=candidate,
+                report_ids=cluster_ids,
+                similarity_scores=join_scores,
+                avg_similarity=float(np.mean(pairwise_scores)) if pairwise_scores else 1.0,
+            )
+        )
+
+    logger.info(
+        "[Tier2] Candidate '%s' — %d usable report(s) -> %d multi-report cluster(s)",
+        candidate.group_key,
+        n,
+        len(clusters),
+    )
+
     return clusters
 
 
@@ -412,7 +531,7 @@ async def run_sweep(db: AsyncSession) -> dict:
         all_clusters.extend(clusters)
 
     if not all_clusters:
-        logger.info("[Tier2] Sweep complete — no clusters found.")
+        logger.warning("[Tier2] Candidates were found, but no multi-report semantic clusters met the similarity threshold.")
         return {
             "candidates_found": len(candidates),
             "clusters_analysed": 0,
