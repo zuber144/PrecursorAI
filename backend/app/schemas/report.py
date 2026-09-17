@@ -18,6 +18,9 @@ class ReportCreate(BaseModel):
     location: Optional[str] = None
     asset_id: Optional[str] = None
 
+class ClarificationSubmit(BaseModel):
+    answer: str = Field(..., min_length=1)
+
 
 # ── Nested analysis summary (used in submit response) ─────────────────────
 
@@ -55,6 +58,7 @@ class ReportSubmitResponse(BaseModel):
     report_id: uuid.UUID
     status: str
     analysis: Optional[AnalysisSummary] = None
+    followup_question: Optional[str] = None
 
 
 class ReportListItem(BaseModel):

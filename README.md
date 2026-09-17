@@ -1,4 +1,4 @@
-﻿# PrecursorAI
+# PrecursorAI
 
 > **AI-powered safety intelligence system for Oil India Limited (OIL)**
 > Real-time SIF precursor detection (Tier 1) + historical cross-report pattern analysis (Tier 2)
@@ -122,9 +122,11 @@ A report is classified as **SIF-potential** only if **all three** are present:
 | **Person in proximity** | A person was or could be in the path of harm |
 | **Barrier failed/missing** | A safety control that should have prevented exposure was absent, bypassed, degraded, or failed |
 
-If any one factor is absent or uncertain: Non-SIF-potential, with `requires_followup = true` if uncertain.
+If any one factor is absent or uncertain, the AI evaluates information sufficiency (Lara et al. 2024 model). If the missing information is critical to the SIF determination, the system halts scoring, sets `requires_followup = true`, and asks the user **one targeted question**. Once answered, the evaluation resumes.
 
 ### Risk Score Formula
+
+The risk score is only computed by the Python engine *after* all necessary clarifications (if any) are resolved:
 
 ```
 risk_score = barrier_weight + severity_weight + sif_bonus - confidence_penalty
@@ -318,12 +320,14 @@ COGNITION_SIMILARITY_THRESHOLD=0.80  # Cosine similarity threshold for clusterin
 ## Running Locally
 
 ```powershell
-# Backend
+# Backend (Terminal 1)
 cd backend
-.\venv\Scripts\python.exe -m uvicorn app.main:app --port 8000
+.\venv\Scripts\activate
+python -m uvicorn app.main:app --port 8000
 
-# Frontend (separate terminal)
+# Frontend (Terminal 2)
 cd frontend
+npm install
 npm run dev
 ```
 
@@ -343,13 +347,14 @@ The database, pgvector extension, all tables, and the 438 RAG knowledge chunks a
 # 2. Install Python dependencies
 cd backend
 python -m venv venv
-.\venv\Scripts\pip install -r requirements.txt
+.\venv\Scripts\activate
+pip install -r requirements.txt
 
 # 3. Ingest IOGP knowledge base
-.\venv\Scripts\python.exe scripts\ingest_knowledge.py
+python scripts\ingest_knowledge.py
 
 # 4. (Optional) Seed sample reports
-.\venv\Scripts\python.exe scripts\seed_reports.py
+python scripts\seed_reports.py
 ```
 
 ---

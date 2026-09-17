@@ -28,8 +28,9 @@ from app.ai.rag import retrieve_relevant_chunks
 from app.ai.risk_engine import compute_risk_score, determine_risk_level
 from app.models.embedding import ReportEmbedding
 from app.models.analysis import ReportAnalysis
+from app.models.clarification import ReportClarification
 from app.models.report import Report
-from app.schemas.report import ReportCreate, ReportSubmitResponse, AnalysisSummary, ReportListItem, ReportDetail
+from app.schemas.report import ReportCreate, ReportSubmitResponse, AnalysisSummary, ReportListItem, ReportDetail, ClarificationSubmit
 
 logger = logging.getLogger(__name__)
 
@@ -70,14 +71,65 @@ async def submit_and_analyze(payload: ReportCreate, db: AsyncSession) -> ReportS
         # 5. Gemini Classification
         gemini_out = await classify_report(clean_text, knowledge_chunks)
 
-        # 6. Deterministic Risk Engine
+        # 6. Check if clarification is needed
+        primary_rule = gemini_out.life_saving_rules[0] if gemini_out.life_saving_rules else None
+
+        if gemini_out.requires_followup and gemini_out.followup_question:
+            # --- CLARIFICATION PATH ---
+            # Calculate provisional score anyway based on initial assumptions
+            risk_score = compute_risk_score(gemini_out)
+            risk_level = determine_risk_level(risk_score)
+
+            # Save partial analysis
+            analysis = ReportAnalysis(
+                report_id=report.id,
+                sif_potential=gemini_out.sif_potential,
+                confidence=gemini_out.confidence_score,
+                risk_score=risk_score,
+                risk_level=risk_level,
+                activity=gemini_out.activity,
+                hazard=gemini_out.hazard,
+                energy_source=gemini_out.energy_source,
+                person_in_proximity=gemini_out.person_in_proximity,
+                barrier=gemini_out.barrier,
+                barrier_status=gemini_out.barrier_status,
+                iogp_rule=primary_rule,
+                severity=gemini_out.severity,
+                rationale=gemini_out.rationale,
+                information_sufficiency=gemini_out.information_sufficiency,
+                information_sufficiency_reason=gemini_out.information_sufficiency_reason,
+                requires_followup=True,
+                followup_question=gemini_out.followup_question,
+                followup_reason=gemini_out.followup_reason
+            )
+            db.add(analysis)
+
+            # Create audit trail record
+            clarification = ReportClarification(
+                report_id=report.id,
+                question=gemini_out.followup_question
+            )
+            db.add(clarification)
+
+            report.status = "NEEDS_CLARIFICATION"
+            await db.commit()
+
+            return ReportSubmitResponse(
+                report_id=report.id,
+                status=report.status,
+                followup_question=gemini_out.followup_question,
+                analysis=AnalysisSummary(
+                    sif_potential=analysis.sif_potential,
+                    risk_level=analysis.risk_level,
+                    risk_score=analysis.risk_score,
+                    iogp_rule=primary_rule
+                )
+            )
+
+        # --- NORMAL PATH (No clarification needed) ---
         risk_score = compute_risk_score(gemini_out)
         risk_level = determine_risk_level(risk_score)
 
-        # Map the primary IOGP rule if any exist
-        primary_rule = gemini_out.life_saving_rules[0] if gemini_out.life_saving_rules else None
-
-        # 7. Save Analysis
         analysis = ReportAnalysis(
             report_id=report.id,
             sif_potential=gemini_out.sif_potential,
@@ -87,23 +139,27 @@ async def submit_and_analyze(payload: ReportCreate, db: AsyncSession) -> ReportS
             activity=gemini_out.activity,
             hazard=gemini_out.hazard,
             energy_source=gemini_out.energy_source,
+            person_in_proximity=gemini_out.person_in_proximity,
             barrier=gemini_out.barrier,
             barrier_status=gemini_out.barrier_status,
             iogp_rule=primary_rule,
             severity=gemini_out.severity,
             rationale=gemini_out.rationale,
-            requires_followup=gemini_out.requires_followup,
-            followup_question=gemini_out.followup_question
+            information_sufficiency=gemini_out.information_sufficiency,
+            information_sufficiency_reason=gemini_out.information_sufficiency_reason,
+            requires_followup=False,
+            followup_question=None,
+            followup_reason=None
         )
         db.add(analysis)
 
-        # 8. Triage & Alerting routing logic
+        # Triage & Alerting routing logic
         from app.services.triage_service import route_report
         await route_report(analysis, report, db)
 
+        report.status = "ANALYZED"
         await db.commit()
 
-        # Build response summary
         summary = AnalysisSummary(
             sif_potential=analysis.sif_potential,
             risk_level=analysis.risk_level,
@@ -130,6 +186,92 @@ async def submit_and_analyze(payload: ReportCreate, db: AsyncSession) -> ReportS
                 risk_score=50,
                 iogp_rule=None
             )
+        )
+
+
+async def submit_clarification(report_id: uuid.UUID, payload: ClarificationSubmit, db: AsyncSession) -> ReportSubmitResponse:
+    """Handle the user's answer to a clarification question."""
+    stmt = select(Report).options(
+        selectinload(Report.analysis),
+        selectinload(Report.clarifications),
+        selectinload(Report.embedding)
+    ).where(Report.id == report_id)
+    
+    result = await db.execute(stmt)
+    report = result.scalars().first()
+
+    if not report or report.status != "NEEDS_CLARIFICATION":
+        raise ValueError("Report not found or not in NEEDS_CLARIFICATION state")
+
+    # Update audit trail
+    active_clarification = next((c for c in report.clarifications if c.answer is None), None)
+    if active_clarification:
+        active_clarification.answer = payload.answer
+
+    # Combine text for re-classification
+    combined_text = f"ORIGINAL REPORT:\n{report.report_text}\n\nCLARIFICATION PROVIDED BY REPORTER:\nQuestion: {active_clarification.question if active_clarification else 'Unknown'}\nAnswer: {payload.answer}"
+
+    try:
+        clean_text = preprocess_report_text(combined_text)
+        
+        # We reuse the original embedding for RAG to keep context stable
+        embedding_vec = report.embedding.embedding
+        knowledge_chunks = await retrieve_relevant_chunks(embedding_vec, db)
+
+        # 2nd pass LLM
+        gemini_out = await classify_report(clean_text, knowledge_chunks)
+
+        # Calculate final risk score
+        risk_score = compute_risk_score(gemini_out)
+        risk_level = determine_risk_level(risk_score)
+        primary_rule = gemini_out.life_saving_rules[0] if gemini_out.life_saving_rules else None
+
+        # Update the analysis row
+        analysis = report.analysis
+        analysis.sif_potential = gemini_out.sif_potential
+        analysis.confidence = gemini_out.confidence_score
+        analysis.risk_score = risk_score
+        analysis.risk_level = risk_level
+        analysis.activity = gemini_out.activity
+        analysis.hazard = gemini_out.hazard
+        analysis.energy_source = gemini_out.energy_source
+        analysis.person_in_proximity = gemini_out.person_in_proximity
+        analysis.barrier = gemini_out.barrier
+        analysis.barrier_status = gemini_out.barrier_status
+        analysis.iogp_rule = primary_rule
+        analysis.severity = gemini_out.severity
+        analysis.rationale = gemini_out.rationale
+        analysis.information_sufficiency = gemini_out.information_sufficiency
+        analysis.information_sufficiency_reason = gemini_out.information_sufficiency_reason
+        analysis.requires_followup = False  # Enforce max 1 question limit
+        analysis.followup_question = None
+
+        # Route
+        from app.services.triage_service import route_report
+        await route_report(analysis, report, db)
+
+        report.status = "ANALYZED"
+        await db.commit()
+
+        summary = AnalysisSummary(
+            sif_potential=analysis.sif_potential,
+            risk_level=analysis.risk_level,
+            risk_score=analysis.risk_score,
+            iogp_rule=analysis.iogp_rule
+        )
+        
+        return ReportSubmitResponse(
+            report_id=report.id,
+            status=report.status,
+            analysis=summary
+        )
+    except Exception as e:
+        logger.exception("Tier 1 clarification pipeline exception for report %s", report.id)
+        report.status = "ERROR"
+        await db.commit()
+        return ReportSubmitResponse(
+            report_id=report.id,
+            status="ERROR"
         )
 
 

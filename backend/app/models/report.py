@@ -39,3 +39,4 @@ class Report(Base):
     embedding = relationship("ReportEmbedding", back_populates="report", uselist=False)
     pattern_links = relationship("PatternReport", back_populates="report")
     alerts = relationship("Alert", back_populates="report")
+    clarifications = relationship("ReportClarification", back_populates="report", order_by="ReportClarification.created_at")

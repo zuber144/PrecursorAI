@@ -24,7 +24,8 @@ async def route_report(analysis: ReportAnalysis, report: Report, db: AsyncSessio
     and trigger alerts if necessary.
     """
     # 1. Human-in-the-loop checks (low confidence or explicit follow-up needed)
-    if needs_human_review(analysis):
+    #    OR if the risk level is higher than ROUTINE (user requested to keep non-routine in REVIEW until dismissed via Alerts)
+    if needs_human_review(analysis) or analysis.risk_level != "ROUTINE":
         report.status = "REVIEW"
     else:
         report.status = "ANALYZED"

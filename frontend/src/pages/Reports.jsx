@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import { Link } from 'react-router-dom'
-import { listReports, submitReport } from '../services/api'
+import { listReports, submitReport, submitClarification } from '../services/api'
 import { Activity, Plus, ChevronRight, AlertTriangle, Info } from 'lucide-react'
 import heroImage from '../assets/image1.png'
 import '../ops/styles/reports.css'
@@ -31,6 +31,11 @@ export default function Reports({ role }) {
     location:    '',
     asset_id:    '',
   })
+  const [clarification, setClarification] = useState({
+    reportId: null,
+    question: null,
+    answer: ''
+  })
 
   useEffect(() => {
     if (role === 'ADMIN') {
@@ -42,11 +47,34 @@ export default function Reports({ role }) {
     e.preventDefault()
     setSubmitting(true)
     try {
-      await submitReport(form)
-      setForm({ report_type: 'NEAR_MISS', report_text: '', location: '', asset_id: '' })
-      alert("Report successfully submitted to the AI analysis queue.")
+      const res = await submitReport(form)
+      if (res.data.status === 'NEEDS_CLARIFICATION') {
+        setClarification({ 
+          reportId: res.data.report_id, 
+          question: res.data.followup_question, 
+          answer: '' 
+        })
+      } else {
+        setForm({ report_type: 'NEAR_MISS', report_text: '', location: '', asset_id: '' })
+        alert("Report successfully submitted to the AI analysis queue.")
+      }
     } catch (err) {
       alert("Failed to submit report. Backend may be offline.")
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  const handleClarificationSubmit = async (e) => {
+    e.preventDefault()
+    setSubmitting(true)
+    try {
+      await submitClarification(clarification.reportId, { answer: clarification.answer })
+      setClarification({ reportId: null, question: null, answer: '' })
+      setForm({ report_type: 'NEAR_MISS', report_text: '', location: '', asset_id: '' })
+      alert("Clarification submitted. AI analysis complete.")
+    } catch (err) {
+      alert("Failed to submit clarification.")
     } finally {
       setSubmitting(false)
     }
@@ -69,7 +97,7 @@ export default function Reports({ role }) {
 
       {/* Content */}
       <div className="reports-content">
-        {role === 'USER' && (
+        {role === 'USER' && !clarification.reportId && (
           <div className="report-form-panel">
             <h2>Submit Safety Report</h2>
             <form onSubmit={handleSubmit}>
@@ -119,6 +147,40 @@ export default function Reports({ role }) {
               <div className="form-actions">
                 <button type="submit" className="btn-primary" disabled={submitting}>
                   {submitting ? <><Activity size={14} className="spin" /> Analyzing...</> : 'Submit to AI'}
+                </button>
+              </div>
+            </form>
+          </div>
+        )}
+
+        {role === 'USER' && clarification.reportId && (
+          <div className="report-form-panel">
+            <h2>Additional Information Required</h2>
+            <div style={{ backgroundColor: '#FFFBEB', borderLeft: '4px solid #F59E0B', padding: '1rem', marginBottom: '1.5rem', borderRadius: '4px' }}>
+              <p style={{ margin: 0, color: '#92400E', fontWeight: 500, display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                <AlertTriangle size={16} />
+                AI Clarification Needed
+              </p>
+              <p style={{ margin: '0.5rem 0 0 0', color: '#92400E' }}>
+                {clarification.question}
+              </p>
+            </div>
+            <form onSubmit={handleClarificationSubmit}>
+              <div className="form-field">
+                <label>Your Answer</label>
+                <textarea
+                  className="form-textarea"
+                  rows={3}
+                  value={clarification.answer}
+                  onChange={(e) => setClarification({ ...clarification, answer: e.target.value })}
+                  placeholder="Type your answer here..."
+                  required
+                  autoFocus
+                />
+              </div>
+              <div className="form-actions">
+                <button type="submit" className="btn-primary" style={{ backgroundColor: '#F59E0B', color: 'white' }} disabled={submitting}>
+                  {submitting ? <><Activity size={14} className="spin" /> Analyzing...</> : 'Submit Answer'}
                 </button>
               </div>
             </form>

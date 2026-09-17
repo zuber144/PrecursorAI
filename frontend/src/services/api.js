@@ -16,6 +16,7 @@ const api = axios.create({
 export const submitReport = (payload) => api.post('/reports', payload)
 export const listReports = (params = {}) => api.get('/reports', { params })
 export const getReport = (id) => api.get(`/reports/${id}`)
+export const submitClarification = (id, payload) => api.post(`/reports/${id}/clarify`, payload)
 
 // ── Dashboard ─────────────────────────────────────────────────────────────────
 

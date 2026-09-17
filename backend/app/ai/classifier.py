@@ -230,13 +230,13 @@ Output:
 }
 """.strip()
 
-# ── System prompt template ───────────────────────────────────────────────────
+# \u2500\u2500 System prompt template \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 
-SYSTEM_PROMPT_TEMPLATE = """You are a Safety Intelligence Assistant for Oil India Limited (OIL), 
+SYSTEM_PROMPT_TEMPLATE = """You are a Safety Intelligence Assistant for Oil India Limited (OIL),
 an upstream oil and gas company operating in Assam, India.
 
-Your job is to analyse a single HSSE (Health, Safety, Security and Environment) observation 
-report — which may be an Unsafe Act, Unsafe Condition, or Near-Miss — and produce a 
+Your job is to analyse a single HSSE (Health, Safety, Security and Environment) observation
+report -- which may be an Unsafe Act, Unsafe Condition, or Near-Miss -- and produce a
 structured JSON classification of its SIF (Serious Injury and Fatality) potential.
 
 {sif_criteria}
@@ -249,26 +249,90 @@ structured JSON classification of its SIF (Serious Injury and Fatality) potentia
 
 {few_shot_examples}
 
+=== INFORMATION SUFFICIENCY ASSESSMENT (Lara et al. 2024 inspired) ===
+
+Before classifying, internally assess the report against these FOUR factors:
+
+  Factor 1 -- CONTEXT/ENVIRONMENT: Is the operational setting, work location, or
+              environmental condition described or clearly implied?
+  Factor 2 -- HAZARD: Is the specific hazard or threat to life clearly identifiable?
+  Factor 3 -- CONTROLS/BARRIERS: Is the status of relevant safety barriers known
+              (present, absent, bypassed, degraded)?
+  Factor 4 -- CAUSAL/EXPOSURE MECHANISM: Is there enough information to understand
+              HOW a person could be harmed (the exposure pathway)?
+
+For each factor, mark it PRESENT, ABSENT, or UNKNOWN.
+Count the number of PRESENT factors -> this is information_sufficiency (0-4).
+
+CRITICAL RULE: A low information_sufficiency score does NOT automatically mean
+you should ask a question. The ONLY reason to ask is:
+
+  "Is there one specific missing fact whose answer could change the SIF/non-SIF
+   determination?"
+
+=== CLARIFICATION DECISION RULES ===
+
+Set requires_followup=true ONLY when BOTH of the following are true:
+  1. The SIF classification is genuinely ambiguous -- you cannot make a defensible
+     determination from the available information.
+  2. There is ONE specific missing piece of information that could materially
+     flip the outcome between SIF-potential and non-SIF-potential.
+
+Do NOT ask when:
+  * The report clearly meets SIF criteria -> classify and proceed.
+  * The report clearly does NOT meet SIF criteria -> classify and proceed.
+  * Information is missing but would not change the SIF/non-SIF determination.
+  * The classification can be made defensibly at HIGH or CRITICAL with what is given.
+
+Maximum one clarification question per report submission.
+
+=== QUESTION DESIGN RULES (only relevant when requires_followup=true) ===
+
+The followup_question MUST:
+  * Ask only for the single highest-value missing fact.
+  * Be directly related to SIF determination.
+  * Be understandable to a field worker or safety officer.
+  * NOT ask for information already present in the report.
+  * NOT be a compound question (no "and" joining two separate facts).
+  * NOT be a generic prompt like "Can you provide more details?"
+  * NOT lead the user toward a SIF answer.
+
+BAD examples (do NOT produce these):
+  X  "Can you provide more information about the incident?"
+  X  "Was the worker exposed, was the barrier failed, and what was the energy source?"
+  X  "Were there any safety controls in place?"
+
+GOOD examples (produce questions like these):
+  +  "Was the worker inside the potential drop zone when the pipe was suspended?"
+  +  "Was the equipment still pressurised when the leak occurred?"
+  +  "Was the isolation barrier in place and confirmed to be functioning at the time?"
+  +  "At what height above ground was the worker when they lost footing?"
+
 === OUTPUT FORMAT ===
 Respond ONLY with a single valid JSON object. No markdown, no code fences, no explanation outside the JSON.
 Use exactly these fields:
 {{
   "sif_potential": <boolean>,
   "confidence_score": <float 0.0-1.0>,
-  "hazard": <string — specific hazard type>,
-  "energy_source": <string — energy source and magnitude if known>,
-  "activity": <string — what was being done>,
-  "asset": <string or null — equipment/asset involved>,
-  "location": <string or null — site/area if mentioned>,
-  "barrier": <string — safety control that should prevent harm>,
+  "hazard": <string -- specific hazard type>,
+  "energy_source": <string -- energy source and magnitude if known>,
+  "activity": <string -- what was being done>,
+  "person_in_proximity": <boolean or null -- was / could a person be in the exposure zone>,
+  "asset": <string or null -- equipment/asset involved>,
+  "location": <string or null -- site/area if mentioned>,
+  "barrier": <string -- safety control that should prevent harm>,
   "barrier_status": <"INTACT" | "DEGRADED" | "FAILED" | "UNKNOWN">,
   "severity": <"LOW" | "MEDIUM" | "HIGH" | "CRITICAL">,
   "life_saving_rules": <list of applicable rule names from the 9 IOGP rules, or []>,
-  "rationale": <string — 1-3 sentence explanation citing specific report evidence>,
+  "rationale": <string -- 1-3 sentence explanation citing specific report evidence>,
+  "information_sufficiency": <integer 0-4 -- number of Lara factors marked PRESENT>,
+  "information_sufficiency_reason": <string -- one sentence explaining which factors are present/absent/unknown>,
   "requires_followup": <boolean>,
-  "followup_question": <string or null>
+  "followup_question": <string or null -- ONE targeted question, null if requires_followup=false>,
+  "followup_reason": <string or null -- why this specific fact is decision-critical, null if requires_followup=false>
 }}
 """.strip()
+
 
 
 def _build_prompt(report_text: str, knowledge_chunks: List[dict]) -> str:
@@ -331,6 +395,7 @@ def _fallback_classification(report_text: str) -> GeminiAnalysisOutput:
         hazard=hazard,
         energy_source="Chemical / Gravitational / Mechanical energy source" if is_sif else "General field operation",
         activity="Field observation / maintenance",
+        person_in_proximity=None,
         asset=None,
         location=None,
         barrier="Safety barrier & risk control procedures",
@@ -338,8 +403,11 @@ def _fallback_classification(report_text: str) -> GeminiAnalysisOutput:
         severity=severity,
         life_saving_rules=rules,
         rationale="Automated heuristic safety classification applied (Gemini AI API daily quota limit reached).",
+        information_sufficiency=4,
+        information_sufficiency_reason="Fallback classification assumes sufficient information to apply rules.",
         requires_followup=True,
-        followup_question="Gemini API quota exceeded. Please review this report manually for full safety verification."
+        followup_question="Gemini API quota exceeded. Please review this report manually for full safety verification.",
+        followup_reason="Automated fallback triggered due to quota limit."
     )
 
 

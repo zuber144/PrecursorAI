@@ -8,8 +8,8 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
-from app.schemas.report import ReportCreate, ReportDetail, ReportListItem, ReportSubmitResponse
-from app.services.report_service import submit_and_analyze
+from app.schemas.report import ReportCreate, ReportDetail, ReportListItem, ReportSubmitResponse, ClarificationSubmit
+from app.services.report_service import submit_and_analyze, submit_clarification
 from app.services.report_service import list_reports as list_reports_service
 from app.services.report_service import get_report as get_report_service
 
@@ -26,6 +26,17 @@ async def submit_report(payload: ReportCreate, db: AsyncSession = Depends(get_db
     Returns a summary of the analysis result.
     """
     return await submit_and_analyze(payload, db)
+
+
+@router.post("/{report_id}/clarify", response_model=ReportSubmitResponse, status_code=status.HTTP_202_ACCEPTED)
+async def clarify_report(report_id: UUID, payload: ClarificationSubmit, db: AsyncSession = Depends(get_db)):
+    """
+    Submit an answer to an AI clarification question.
+    """
+    try:
+        return await submit_clarification(report_id, payload, db)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
 
 @router.get("", response_model=List[ReportListItem])
