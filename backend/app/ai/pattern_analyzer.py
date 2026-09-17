@@ -1,13 +1,16 @@
 """
-ai/pattern_analyzer.py — Tier 2 multi-report pattern reasoning via Gemini.
+ai/pattern_analyzer.py — Tier 2 multi-report pattern reasoning via Ollama/Qwen3.
 
-Responsibilities (Gemini):
+Embeddings: Gemini (unchanged — see embeddings.py + pattern_service.py clustering)
+Generation: Ollama + Qwen3:4b (via OpenAI-compatible endpoint)
+
+Responsibilities (Qwen):
   - Understand whether a cluster of reports share the same underlying hazard
   - Classify the pattern type (RECURRING / EMERGING / COMPOUNDING / SYSTEMIC)
   - Provide a plain-English conclusion and evidence list
   - Suggest a priority (cross-checked by the rules engine, NOT used directly)
 
-NOT Gemini's responsibility:
+NOT the LLM's responsibility:
   - Final priority (Phase E rules engine cross-checks this)
   - Whether a cluster becomes a stored pattern (threshold gate does this)
   - Report-level SIF classification (Tier 1's classifier.py handles that)
@@ -19,7 +22,8 @@ import json
 import logging
 from typing import List
 
-from app.ai.gemini import get_client
+from app.ai.ollama_client import generate_ollama_json
+from app.core.config import settings
 from app.schemas.pattern import GeminiPatternOutput
 from app.services.pattern_service import ReportCluster
 
@@ -184,10 +188,45 @@ def _build_pattern_prompt(
         f"Reports in this semantic cluster: {len(cluster.report_ids)}\n"
         f"Average embedding similarity: {cluster.avg_similarity:.2f}\n\n"
         f"REPORT TEXTS:\n{reports_block}\n"
-        f"=== END REQUEST ==="
+        f"=== END REQUEST ===\n\n"
+        f"Respond ONLY with a single valid JSON object directly. No explanations outside the JSON."
     )
 
     return f"{system_prompt}\n\n{user_message}"
+
+
+def _build_pattern_messages(
+    cluster: ReportCluster,
+    report_texts: List[str],
+) -> List[dict]:
+    cand = cluster.candidate
+    dim_label = "Asset" if cand.dimension == "asset_id" else "Location"
+
+    reports_block = "\n".join(
+        f"  [{i+1}] \"{text.strip()}\""
+        for i, text in enumerate(report_texts)
+    )
+
+    system_prompt = PATTERN_SYSTEM_PROMPT.format(
+        few_shot_examples=PATTERN_FEW_SHOT_EXAMPLES
+    )
+
+    user_message = (
+        f"=== PATTERN ANALYSIS REQUEST ===\n"
+        f"{dim_label}: {cand.value}\n"
+        f"Reports in last 30 days: {cand.report_count_30d}\n"
+        f"Reports in last 7 days:  {cand.report_count_7d}\n"
+        f"Reports in this semantic cluster: {len(cluster.report_ids)}\n"
+        f"Average embedding similarity: {cluster.avg_similarity:.2f}\n\n"
+        f"REPORT TEXTS:\n{reports_block}\n"
+        f"=== END REQUEST ===\n\n"
+        f"Respond ONLY with a single valid JSON object directly. No explanations outside the JSON."
+    )
+
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_message},
+    ]
 
 
 def _fallback_pattern(cluster: ReportCluster, report_texts: List[str]) -> GeminiPatternOutput:
@@ -206,41 +245,29 @@ def _fallback_pattern(cluster: ReportCluster, report_texts: List[str]) -> Gemini
     )
 
 
+
 async def analyze_cluster(
     cluster: ReportCluster,
     report_texts: List[str],
 ) -> GeminiPatternOutput:
     """
-    Phase D — Steps 9-12.
+    Phase D -- Steps 9-12.
 
-    Send a cluster of grouped reports to Gemini for multi-report pattern reasoning.
+    Send a cluster of grouped reports to Ollama/Qwen for multi-report pattern reasoning.
     Returns a validated GeminiPatternOutput.
 
     Retries once on malformed JSON.
-    Falls back to heuristic pattern output if Gemini API quota is reached (429).
+    Falls back to heuristic pattern output if Ollama is unavailable.
     """
-    try:
-        model = get_client()
-    except Exception as e:
-        logger.warning("[Tier2] Could not get Gemini client (%s). Using fallback pattern.", e)
-        return _fallback_pattern(cluster, report_texts)
-
-    prompt = _build_pattern_prompt(cluster, report_texts)
-
-    generation_config = {
-        "response_mime_type": "application/json",
-        "response_schema": GeminiPatternOutput,
-        "temperature": 0.15,      # Slightly higher than Tier 1 for nuanced reasoning
-        "max_output_tokens": 1024,
-    }
+    messages = _build_pattern_messages(cluster, report_texts)
 
     for attempt in range(2):
         try:
-            response = model.generate_content(
-                prompt,
-                generation_config=generation_config,
+            raw = await generate_ollama_json(
+                messages,
+                temperature=0.15,
+                num_predict=800,
             )
-            raw = response.text.strip()
 
             # Strip accidental code fences
             if raw.startswith("```"):
@@ -249,18 +276,24 @@ async def analyze_cluster(
                     raw = raw[4:]
                 raw = raw.strip()
 
+            # Find outermost JSON object
+            s_idx = raw.find("{")
+            e_idx = raw.rfind("}")
+            if s_idx != -1 and e_idx != -1 and e_idx > s_idx:
+                raw = raw[s_idx : e_idx + 1]
+
             data = json.loads(raw)
             return GeminiPatternOutput(**data)
 
-        except (json.JSONDecodeError, Exception) as e:
+        except Exception as e:
             err_str = str(e)
-            if "429" in err_str or "Quota exceeded" in err_str or "ResourceExhausted" in err_str:
-                logger.warning("[Tier2] Gemini free tier quota limit reached (429). Using fallback pattern synthesis.")
+            if "connection" in err_str.lower() or "refused" in err_str.lower():
+                logger.error("[Tier2] Ollama server unavailable (%s). Using fallback pattern.", e)
                 return _fallback_pattern(cluster, report_texts)
 
             if attempt == 0:
                 logger.warning(
-                    "[Tier2] Gemini returned invalid JSON on attempt 1, retrying. "
+                    "[Tier2] Ollama/Qwen returned invalid JSON on attempt 1, retrying. "
                     "Cluster: %s. Error: %s",
                     cluster.candidate.group_key, e,
                 )
@@ -270,4 +303,3 @@ async def analyze_cluster(
                 cluster.candidate.group_key, e,
             )
             return _fallback_pattern(cluster, report_texts)
-
