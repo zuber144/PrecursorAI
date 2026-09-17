@@ -7,12 +7,8 @@ class Settings(BaseSettings):
     # Database
     DATABASE_URL: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/precursorai"
 
-    # Gemini (embeddings only)
+    # Gemini
     GEMINI_API_KEY: str = ""
-
-    # Ollama (text generation / reasoning)
-    OLLAMA_BASE_URL: str = "http://localhost:11434"
-    OLLAMA_MODEL: str = "qwen3:4b"
 
     # App
     APP_ENV: str = "development"
